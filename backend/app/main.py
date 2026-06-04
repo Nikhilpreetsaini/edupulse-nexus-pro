@@ -153,7 +153,6 @@ def categorize_prediction(prob: float) -> str:
     return "High"
 
 
-
 def generate_student_record(risk: str) -> dict:
     """Generate a single student record with numeric features sampled
     from ranges representative of the given risk category.
@@ -208,7 +207,6 @@ def generate_student_record(risk: str) -> dict:
     }
 
 
-
 def generate_demo_dataset() -> pd.DataFrame:
     """Create a synthetic demo dataset of 120 students (40 per risk class).
 
@@ -225,6 +223,23 @@ def generate_demo_dataset() -> pd.DataFrame:
     for _ in range(40):
         records.append(generate_student_record("High"))
     return pd.DataFrame(records)
+
+# Automatically load a demo dataset at startup if none has been uploaded.
+# This ensures that endpoints like /statistics and /students have data
+# available even before the first call to /seed_demo or /upload_dataset.
+@app.on_event("startup")
+async def load_default_dataset() -> None:
+    global DATASET, MODEL
+    # Only populate the dataset if it hasn't been loaded yet.  This
+    # prevents overriding an uploaded dataset when the server restarts.
+    if DATASET is None:
+        df = generate_demo_dataset()
+        try:
+            train_model(df)
+        except Exception:
+            # If training fails, still load the raw dataset so that
+            # statistics can be computed.  Leave MODEL as None.
+            DATASET = df
 
 
 @app.get("/")
@@ -358,8 +373,20 @@ async def get_statistics():
 
     Includes the number of records, numeric column means and standard deviations.
     """
+    global DATASET
+    # If no dataset has been loaded yet, generate a default demo dataset
     if DATASET is None:
-        raise HTTPException(status_code=404, detail="No dataset loaded")
+        df = generate_demo_dataset()
+        # Do not train the model here; statistics do not require a model.
+        DATASET = df
+        # Derive feature columns for statistics only; this avoids training
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if "riskLevel" in numeric_cols:
+            numeric_cols.remove("riskLevel")
+        if numeric_cols:
+            FEATURE_COLUMNS.clear()
+            FEATURE_COLUMNS.extend(numeric_cols)
+    # Compute summary statistics
     summary = {
         "records": int(len(DATASET)),
         "numeric_means": DATASET[FEATURE_COLUMNS].mean().to_dict(),
