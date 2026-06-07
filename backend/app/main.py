@@ -23,7 +23,7 @@ adding it via GitHub's contents API will produce a working backend.
 """
 
 from typing import List, Optional
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
@@ -402,3 +402,76 @@ async def model_insights():
     if not hasattr(app.state, "model_metrics"):
         raise HTTPException(status_code=404, detail="Model metrics not available")
     return app.state.model_metrics
+
+# ---------------------------------------------------------------------------
+# Additional API endpoints for enhanced functionality
+#
+# The endpoints below provide extra capabilities beyond the core upload,
+# prediction and statistics APIs.  They make it easier to explore the
+# dataset, download it, reset the model, and perform batch predictions.
+
+from typing import List as _List  # avoid clashing with existing List alias
+
+@app.get("/feature_means")
+async def feature_means():
+    """Return the mean value for each numeric feature in the current dataset."""
+    if DATASET is None:
+        raise HTTPException(status_code=404, detail="No dataset loaded")
+    # Determine numeric columns if FEATURE_COLUMNS is empty
+    cols = FEATURE_COLUMNS if FEATURE_COLUMNS else [c for c in DATASET.select_dtypes(include=[np.number]).columns if c != "riskLevel"]
+    if not cols:
+        raise HTTPException(status_code=400, detail="No numeric features available")
+    return {col: float(DATASET[col].mean()) for col in cols}
+
+@app.get("/download_dataset")
+async def download_dataset():
+    """Download the current dataset as a CSV file."""
+    if DATASET is None:
+        raise HTTPException(status_code=404, detail="No dataset loaded")
+    csv_data = DATASET.to_csv(index=False)
+    return Response(content=csv_data, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=dataset.csv"})
+
+@app.post("/predict_bulk")
+async def predict_bulk(students: _List[StudentFeatures]):
+    """Predict risk for multiple students at once.
+
+    Accepts a list of student feature sets and returns a list of
+    probability/high-risk predictions for each student.
+    """
+    if MODEL is None or not FEATURE_COLUMNS:
+        raise HTTPException(status_code=400, detail="Model has not been trained yet. Please upload a dataset or seed demo first.")
+    results = []
+    for features in students:
+        df_in = features.to_dataframe()
+        # ensure all feature columns exist
+        for col in FEATURE_COLUMNS:
+            if col not in df_in.columns:
+                df_in[col] = np.nan
+        df_in = df_in[FEATURE_COLUMNS]
+        # simple mean imputation for missing values
+        imputed = df_in.copy()
+        for col in FEATURE_COLUMNS:
+            if imputed[col].isna().any():
+                col_mean = DATASET[col].mean() if DATASET is not None else 0.0
+                imputed[col].fillna(col_mean, inplace=True)
+        probs = MODEL.predict_proba(imputed)[0]
+        prob_high = float(probs[2])
+        risk_level = categorize_prediction(prob_high)
+        results.append({"probability_high": prob_high, "riskLevel": risk_level})
+    return {"predictions": results}
+
+@app.post("/reset")
+async def reset():
+    """Reset the loaded dataset and trained model.
+
+    This endpoint clears the in-memory dataset, model and metrics.
+    The next request to /statistics or /students will load a fresh demo dataset automatically.
+    """
+    global DATASET, MODEL, FEATURE_COLUMNS
+    DATASET = None
+    MODEL = None
+    FEATURE_COLUMNS.clear()
+    # Clear any stored metrics
+    if hasattr(app.state, "model_metrics"):
+        delattr(app.state, "model_metrics")
+    return {"detail": "Dataset and model have been reset."}
